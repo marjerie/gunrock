@@ -173,7 +173,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     edge_t estimated_nzs = P->nnz[0];
 
-    // std::cout << "estimated nzs : " << estimated_nzs << '\n';
+    std::cout << "estimated nzs : " << estimated_nzs << '\n';
 
     /// Step . Allocate upperbound memory for C's values and column indices.
     // column_indices.resize(estimated_nzs, -1);
@@ -273,7 +273,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
               assert(c_nz_idx < estimated_nzs);
 
               // Assign column index.
-              thread::store(&column_indices_vm_ptr[c_nz_idx], n);
+              thread::store(&column_indices_vm_ptr[c_nz_idx], b_col);
               // thread::store(&col_ind[c_nz_idx], n);
 
               // Accumulate the nonzero value.

@@ -135,7 +135,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     thrust::copy(row_offsets.begin() + A.get_number_of_vertices() - 1,
                  row_offsets.begin() + A.get_number_of_vertices(),
-                 row_offsets.begin() + A.get_number_of_vertices());
+                 row_offsets.begin() + A.get_number_of_vertices());    /// why?????? why copy row_offset[#vertices - 1] to row_offset[#vertices]
 
     /// Step X. Calculate the upperbound of total number of nonzeros in the
     /// sparse-matrix C.
@@ -173,6 +173,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
         // Calculate c's nonzero index.
         std::size_t c_nz_idx = c_offset + n;
+        assert(c_nz_idx < estimated_nzs);
 
         // Assign column index.
         thread::store(&col_ind[c_nz_idx], n);

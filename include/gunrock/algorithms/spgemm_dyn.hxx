@@ -77,6 +77,17 @@ struct problem_t : gunrock::problem_t<graph_type> {
   }
 };
 
+struct is_greater_or_equal
+{
+    is_greater_or_equal(int& _val) : val(_val) {}
+    int val;
+    __host__ __device__
+    bool operator()(const int& x)
+    {
+        return (x >= val);
+    }
+};
+
 template <typename problem_t>
 struct enactor_t : gunrock::enactor_t<problem_t> {
   enactor_t(problem_t* _problem,
@@ -107,8 +118,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto& estimated_nz_per_row = P->estimated_nz_per_row;
     auto estimated_nz_ptr = estimated_nz_per_row.data().get();
 
+    cudaEvent_t start_baseline, end_baseline;
+    cudaEventCreate(&start_baseline);
+    cudaEventCreate(&end_baseline);
+
     // Resize row-offsets.
     // row_offsets.resize(A.get_number_of_vertices() + 1);
+
+    cudaEventRecord(start_baseline);
 
     thrust::device_vector<edge_t, thrust::virtual_allocator<edge_t>> row_offsets_vm_d;
     auto& row_offsets_vm = row_offsets_vm_d;
@@ -165,7 +182,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     edge_t estimated_nzs = P->nnz[0];
 
-    std::cout << "estimated nzs : " << estimated_nzs << '\n';
+    // std::cout << "estimated nzs : " << estimated_nzs << '\n';
 
     /// Step . Allocate upperbound memory for C's values and column indices.
     // column_indices.resize(estimated_nzs, -1);
@@ -224,8 +241,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     // printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n",
     //     used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
     
-    size_t num_of_elements_to_fill = (32700000000) / sizeof(int);
-    thrust::device_vector<int> fill_memory(num_of_elements_to_fill, 0);
+    // size_t num_of_elements_to_fill = (32700000000) / sizeof(int);
+    // thrust::device_vector<int> fill_memory(num_of_elements_to_fill, 0);
 
     // cudaMemGetInfo(&free_byte, &total_byte);
     // free_db = (double) free_byte;
@@ -265,7 +282,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
               assert(c_nz_idx < estimated_nzs);
 
               // Assign column index.
-              thread::store(&column_indices_vm_ptr[c_nz_idx], n);
+              thread::store(&column_indices_vm_ptr[c_nz_idx], b_col);
               // thread::store(&col_ind[c_nz_idx], n);
 
               // Accumulate the nonzero value.
@@ -292,6 +309,60 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
         A, naive_spgemm, context);
 
+
+    /// Step X. Fix-up, i.e., remove overestimated nonzeros and rellocate the
+    /// storage as necessary.
+    auto real_nonzeros = [=] __host__ __device__(vertex_t const& row) -> void {
+      edge_t overestimated_nzs = 0;
+      // For all nonzeros within the row of C.
+      for (auto nz = row_offsets_vm_ptr[row]; nz < row_offsets_vm_ptr[row + 1]; ++nz) {
+        // Find the invalid column indices and zero-values, they represent
+        // overestimated nonzeros.
+        if (column_indices_vm_ptr[nz] == -1)
+          overestimated_nzs += 1;
+      }
+      // Remove overestimated nonzeros.
+      estimated_nz_ptr[row] -= overestimated_nzs;
+    };
+
+    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
+        A, real_nonzeros, context);
+
+    thrust::exclusive_scan(policy, P->estimated_nz_per_row.begin(),
+                           P->estimated_nz_per_row.end() + 1, row_offsets_vm.begin(),
+                           edge_t(0), thrust::plus<edge_t>());
+
+    /// Step X. Calculate the upperbound of total number of nonzeros in the
+    /// sparse-matrix C.
+    thrust::copy(row_offsets_vm.begin() + A.get_number_of_vertices(),
+                 row_offsets_vm.begin() + A.get_number_of_vertices() + 1,
+                 P->nnz.begin());
+
+
+    auto itcVM = thrust::copy_if(
+        policy, column_indices_vm.begin(), column_indices_vm.end(),
+        column_indices_vm.begin(),
+        [] __device__(const vertex_t& x) -> bool { return x != -1; });
+
+    auto itVM = thrust::copy_if(policy, nz_vals_vm.begin(),
+                               nz_vals_vm.end(), nz_vals_vm.begin(),
+                               [] __device__(const weight_t& nz) -> bool {
+                                 return nz != weight_t(0);
+                               });
+
+    auto nz_nnz = thrust::distance(nz_vals_vm.begin(), itVM);
+
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(end_baseline);
+
+    cudaEventSynchronize(end_baseline);
+
+    float elapsedTime = 0;
+    cudaEventElapsedTime(&elapsedTime, start_baseline, end_baseline);
+
+    std::cout << "baseline end-to-end time: " << elapsedTime << '\n';
+
     // cudaDeviceSynchronize();
 
     // cudaMemGetInfo(&free_byte, &total_byte);
@@ -312,67 +383,48 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       std::cout << "Error: " << cudaGetErrorString(err) << std::endl;
     }
 
-    cuInit(0);
+    cudaEvent_t start_dyn_spgemm, end_dyn_spgemm;
+    cudaEventCreate(&start_dyn_spgemm);
+    cudaEventCreate(&end_dyn_spgemm);
 
-    int pi;
-    cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM, 0);
+    cudaEvent_t start_dyn_spgemm_kernel, end_dyn_spgemm_kernel;
+    cudaEventCreate(&start_dyn_spgemm_kernel);
+    cudaEventCreate(&end_dyn_spgemm_kernel);
 
-    if (!pi) {
-        throw std::runtime_error{"Device cannot use host pointer for registered memory."};
-    }
-
-    // volatile int* done, *h_done, *cpu_done;
-
-    // int* d_done;
-    // cudaMalloc((int **)&d_done, sizeof(int));
-    // int *h_done = (int *)malloc(sizeof(int));
+    cudaEventRecord(start_dyn_spgemm);
 
     int* d_num_of_extra_chunks;
     cudaMalloc((int **)&d_num_of_extra_chunks, sizeof(int));
-    // int *h_num_of_extra_chunks = (int *)malloc(sizeof(int));
 
-    uint64_t* d_addr;
+    uint64_t* d_addr, *col_addr;
     cudaMalloc((uint64_t **)&d_addr, sizeof(uint64_t));
+    cudaMalloc((uint64_t **)&col_addr, sizeof(uint64_t));
 
     int* d_size_per_thread;
     cudaMalloc((int **)&d_size_per_thread, sizeof(int));
 
-    // weight_t** nz_vals_ptr;
-    // cudaMallocManaged((weight_t **)nz_vals_ptr, sizeof(weight_t));
-
-    size_t initial_size = 524288; // TODO: make it according to number of vertices
-    initial_size = 524288*2;
+    size_t initial_size = 524288;
 
     thrust::device_vector<int> active_row;
     active_row.resize(A.get_number_of_vertices(), 1);
     int* active_row_ptr = active_row.data().get();
 
+    thrust::device_vector<edge_t> b_col_for_row;
+    b_col_for_row.resize(A.get_number_of_vertices(), 0);
+    edge_t* b_col_for_row_ptr = b_col_for_row.data().get();
+
+    thrust::device_vector<int> num_of_iter_per_row;
+    num_of_iter_per_row.resize(A.get_number_of_vertices(), 0);
+    int* num_of_iter_per_row_ptr = num_of_iter_per_row.data().get();
+
     thrust::device_vector<int> row_off;
     row_off.resize(A.get_number_of_vertices() + 1, 0);
     int* row_off_ptr = row_off.data().get();
 
-    // cudaSetDeviceFlags(cudaDeviceMapHost);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "cudaSetDeviceFlags Error: " << cudaGetErrorString(err) << std::endl;
-    // }
-
-    // cudaHostAlloc((void **)h_data, sizeof(weight_t), cudaHostAllocMapped);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "cudaHostAlloc Error: " << cudaGetErrorString(err) << std::endl;
-    // }
-
-    // cudaHostGetDevicePointer((weight_t **)nz_vals_ptr, (weight_t *)*h_data, 0);
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "cudaHostGetDevicePointer Error: " << cudaGetErrorString(err) << std::endl;
-    // }
-
-    // *done = 1;
+    thrust::device_vector<size_t> total_size_per_thread(50, 0);
+    size_t* total_size_per_thread_ptr = total_size_per_thread.data().get();
+    thrust::device_vector<size_t> iter_offset(50, 0);
+    size_t* iter_offset_ptr = iter_offset.data().get();
 
     auto dynamic_spgemm = [=] __host__ __device__(vertex_t const& row) -> bool {
       if (thread::load(&active_row_ptr[row]) == 1) {
@@ -380,21 +432,22 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         auto a_offset = A.get_starting_edge(row);
         auto a_nnz = A.get_number_of_neighbors(row);
         auto row_offset = thread::load(&row_off_ptr[row]);
-        auto c_offset = initial_size * (*d_num_of_extra_chunks) + row_offset * (*d_size_per_thread);
+        // auto c_offset = row_offset * (*d_size_per_thread);
         auto n = 0;
         bool increment = false;
-        int iter = 0;
         weight_t* nz_vals_ptr = (weight_t *) *d_addr;
+        vertex_t* col_ind_ptr = (vertex_t *) *col_addr;
+        int iter = num_of_iter_per_row_ptr[row];
+        auto c_offset = row_offset * total_size_per_thread_ptr[iter];
+        thread::store(&num_of_iter_per_row_ptr[row], num_of_iter_per_row_ptr[row] + 1);
 
         // iterate over the columns of B.
-        for (edge_t b_col = 0; b_col < B.get_number_of_vertices(); ++b_col) {
+        for (edge_t b_col = b_col_for_row_ptr[row]; b_col < B.get_number_of_vertices(); ++b_col) {
           // Get the number of nonzeros in column of sparse-matrix B.
           auto b_offset = B.get_starting_edge(b_col);
           auto b_nnz = B.get_number_of_neighbors(b_col);
           auto b_nz_idx = b_offset;
           auto a_nz_idx = a_offset;
-
-          //if (row == 0) printf("for loop: %d %d\n", num_of_extra_chunks, *extra_chunk_size);
 
           // For the row in A, multiple with corresponding element in B.
           while ((a_nz_idx < (a_offset + a_nnz)) && (b_nz_idx < (b_offset + b_nnz))) {
@@ -403,26 +456,19 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
             //  Multiply if the column of A equals row of B.
             if (a_col == b_row) {
-              if (iter == *d_num_of_extra_chunks) {
+              // if (iter == *d_num_of_extra_chunks) {
                 auto a_nz = A.get_edge_weight(a_nz_idx);
                 auto b_nz = B.get_edge_weight(b_nz_idx);
 
                 // Calculate C's nonzero index.
-                std::size_t c_nz_idx = c_offset + n;
+                std::size_t c_nz_idx = c_offset + iter_offset_ptr[iter] + n;
 
-                // if (c_nz_idx >= (initial_size * ((*d_num_of_extra_chunks) + 1)) )
-                // printf("%lu %d\n", c_offset, n);
-
-                // TODO: Assign column index.
                 // Assign column index.
-                // thread::store(&column_indices_vm_ptr[c_nz_idx], n);
-                // thread::store(&col_ind[c_nz_idx], n);
+                col_ind_ptr[c_nz_idx] = b_col;
 
                 // Accumulate the nonzero value.
-                // if (*real_chunk_size < num_of_extra_chunks) printf("%d %d\n", *real_chunk_size, num_of_extra_chunks);
-                assert(c_nz_idx < (initial_size * ((*d_num_of_extra_chunks) + 1)));
                 nz_vals_ptr[c_nz_idx] += a_nz * b_nz;
-              }
+              // }
               a_nz_idx++;
               b_nz_idx++;
 
@@ -435,12 +481,12 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           if (increment) {
             n++;
             increment = false;
-            if (n == *d_size_per_thread) {
-              if (iter == *d_num_of_extra_chunks) {
+            // if (n == *d_size_per_thread) {
+            if (n == total_size_per_thread_ptr[iter]) {
+                b_col_for_row_ptr[row] = b_col + 1;
+                if ((b_col + 1) >= B.get_number_of_vertices()) 
+                  thread::store(&active_row_ptr[row], 0);
                 return false;
-              }
-              iter++;
-              n = 0;
             }
           }
         }
@@ -450,173 +496,174 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
 
     thrust::device_vector<weight_t, thrust::virtual_allocator<weight_t>> nz_vals;
+    thrust::device_vector<vertex_t, thrust::virtual_allocator<vertex_t>> col_ind;
     // thrust::device_vector<weight_t> nz_vals;
-    // volatile weight_t* nz_vals_ptr = nz_vals.data().get();
 
     int num_of_extra_chunks = -1;
     thrust::device_vector<int>::iterator iter_thrust;
     size_t num_of_active_row = 0;
     size_t size_per_thread = 0;
+    int num = 1;
+    int min_size_per_thread = 8;
+    size_t current_size = 0;
     // size_t size_per_thread = initial_size / A.get_number_of_vertices();
     // std::cout << "size_per_thread: " << size_per_thread << '\n';
+    float total_kernel_time = 0;
 
     do {
+      num = 1;
       num_of_extra_chunks++;
       num_of_active_row = thrust::count(policy, active_row.begin(), active_row.end(), 1);
-      size_per_thread = initial_size / num_of_active_row;
-      cudaMemcpy(d_size_per_thread, &size_per_thread, sizeof(int), cudaMemcpyHostToDevice);
-      cudaMemcpy(d_num_of_extra_chunks, &num_of_extra_chunks, sizeof(int), cudaMemcpyHostToDevice);
+      size_per_thread = initial_size * num / num_of_active_row;
+      while (size_per_thread <= min_size_per_thread) {
+        num++;
+        size_per_thread = initial_size * num / num_of_active_row;
+      }
+      current_size += initial_size * num;
+      iter_offset[num_of_extra_chunks + 1] = current_size;
+      total_size_per_thread[num_of_extra_chunks] = size_per_thread;
+      // cudaMemcpy(d_size_per_thread, &size_per_thread, sizeof(int), cudaMemcpyHostToDevice);
+      // cudaMemcpy(d_num_of_extra_chunks, &num_of_extra_chunks, sizeof(int), cudaMemcpyHostToDevice);
 
-      std::cout << "iter no: " << num_of_extra_chunks << '\n';
-      nz_vals.resize(initial_size * (num_of_extra_chunks + 1));
-      std::cout << "done resizing!\n";
+      // std::cout << "iter no: " << num_of_extra_chunks << '\n';
+      nz_vals.resize(current_size);
+      col_ind.resize(current_size, -1);
+      // nz_vals.resize(initial_size * (num_of_extra_chunks + 1));
+      // col_ind.resize(initial_size * (num_of_extra_chunks + 1), -1);
+      // std::cout << "done resizing!\n";
 
-      std::cout << "nz_vals.data().get(): " << nz_vals.data().get() << '\n';
       uint64_t addr = (uint64_t) nz_vals.data().get();
+      uint64_t c_addr = (uint64_t) col_ind.data().get();
       cudaMemcpy(d_addr, &addr, sizeof(uint64_t), cudaMemcpyHostToDevice);
+      cudaMemcpy(col_addr, &c_addr, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
       thrust::exclusive_scan(policy, active_row.begin(), active_row.end(), row_off.begin());
+
+      float kernelTime;
+      cudaEventRecord(start_dyn_spgemm_kernel);
 
       operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
         A, dynamic_spgemm, context);
       
       cudaDeviceSynchronize();
 
+      cudaEventRecord(end_dyn_spgemm_kernel);
+      cudaEventSynchronize(end_dyn_spgemm_kernel);
+
+      cudaEventElapsedTime(&kernelTime, start_dyn_spgemm_kernel, end_dyn_spgemm_kernel);
+
+      total_kernel_time += kernelTime;
+
       iter_thrust = thrust::find(policy, active_row.begin(), active_row.end(), 1);
     } while(iter_thrust != active_row.end());
 
-    std::cout << "done dynamic_spgemm!\n";
-
     iter_thrust = thrust::find(active_row.begin(), active_row.end(), 1);
+    assert(iter_thrust == active_row.end());
 
-    if (iter_thrust == active_row.end()) std::cout << "yay no active row!\n";
+    cudaEventRecord(end_dyn_spgemm);
 
-    size_t free_byte;
-    size_t total_byte;
-    cudaMemGetInfo(&free_byte, &total_byte);
-    double free_db = (double) free_byte;
-    double total_db = (double) total_byte;
-    double used_db = total_db - free_db ;
-    printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n",
-        used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+    cudaEventSynchronize(end_dyn_spgemm);
 
-    // TODO: Unscramble the output
+    cudaEventElapsedTime(&elapsedTime, start_dyn_spgemm, end_dyn_spgemm);
 
-    // printf("---------------------------------------------------\n");
+    std::cout << "dynamic spgemm: " << elapsedTime << '\n';
 
+    std::cout << "dynamic spgemm kernel time: " << total_kernel_time << '\n';
 
-    // int dis_val = min(30, estimated_nzs);
+    std::cout << "dynamic spgemm resize time: " << elapsedTime - total_kernel_time << '\n';
 
-    // printf("nz_vals_vm[:10] = ");
-    // for (int i = 0; i < dis_val; i++)
-    //   std::cout << nz_vals_vm[i] << ' ';
-    // printf("\n");
+    // size_t free_byte;
+    // size_t total_byte;
+    // cudaMemGetInfo(&free_byte, &total_byte);
+    // double free_db = (double) free_byte;
+    // double total_db = (double) total_byte;
+    // double used_db = total_db - free_db ;
+    // printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n",
+    //     used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
 
-    // printf("nonzero_values[:10] = ");
-    // for (int i = 0; i < dis_val; i++)
-    //   std::cout << nonzero_values[i] << ' ';
-    // printf("\n---------------------------------------------------\n");
+    // cudaEvent_t start_dyn_spgemm_copy, end_dyn_spgemm_copy;
+    // cudaEventCreate(&start_dyn_spgemm_copy);
+    // cudaEventCreate(&end_dyn_spgemm_copy);
 
-    /// Step X. Fix-up, i.e., remove overestimated nonzeros and rellocate the
-    /// storage as necessary.
-    auto real_nonzeros = [=] __host__ __device__(vertex_t const& row) -> void {
-      edge_t overestimated_nzs = 0;
-      // For all nonzeros within the row of C.
-      for (auto nz = row_offsets_vm_ptr[row]; nz < row_offsets_vm_ptr[row + 1]; ++nz) {
-        // Find the invalid column indices and zero-values, they represent
-        // overestimated nonzeros.
-        // if (col_ind[nz] == -1)
-        if (column_indices_vm_ptr[nz] == -1)
-          overestimated_nzs += 1;
-      }
-      // Remove overestimated nonzeros.
-      estimated_nz_ptr[row] -= overestimated_nzs;
-    };
-
-    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
-        A, real_nonzeros, context);
+    // cudaEventRecord(start_dyn_spgemm_copy);
     
-    // cudaDeviceSynchronize();
+    // size_t chunk_size;
+    // size_t chunk_iter_id;
+    // thrust::host_vector<weight_t> nz_vals_h(nz_vals.size(), 0);
+    // thrust::host_vector<vertex_t> col_ind_h(col_ind.size(), -1);
+    // thrust::host_vector<edge_t> row_off_h(A.get_number_of_vertices() + 1, 0);
+    // size_t nz_vals_h_size = 0;
+    // // size_t offset;
 
-    // printf("real_nonzeros kernel done\n");
+    // for (size_t j = 0; j < num_of_iter_per_row.size(); j++) {
+    //   int iters = num_of_iter_per_row[j];
+    //   row_off_h[j + 1] = row_off_h[j];
+    //   // offset = 0;
+    //   for (int chunk_iter = 0; chunk_iter < iters; chunk_iter++) {
+    //     chunk_size = total_size_per_thread[chunk_iter];
 
-    thrust::exclusive_scan(policy, P->estimated_nz_per_row.begin(),
-                           P->estimated_nz_per_row.end(), row_offsets_vm.begin(),
-                           edge_t(0), thrust::plus<edge_t>());
+    //     int val = chunk_iter + 1;
+    //     chunk_iter_id = thrust::count_if(policy, num_of_iter_per_row.begin(), 
+    //       num_of_iter_per_row.begin() + j + 1, is_greater_or_equal(val));
 
-    thrust::copy(row_offsets_vm.begin() + A.get_number_of_vertices() - 1,
-                 row_offsets_vm.begin() + A.get_number_of_vertices(),
-                 row_offsets_vm.begin() + A.get_number_of_vertices());
+    //     chunk_iter_id--;
 
-    /// Step X. Calculate the upperbound of total number of nonzeros in the
-    /// sparse-matrix C.
-    thrust::copy(row_offsets_vm.begin() + A.get_number_of_vertices(),
-                 row_offsets_vm.begin() + A.get_number_of_vertices() + 1,
-                 P->nnz.begin());
-
-
-    auto itcVM = thrust::copy_if(
-        policy, column_indices_vm.begin(), column_indices_vm.end(),
-        column_indices_vm.begin(),
-        [] __device__(const vertex_t& x) -> bool { return x != -1; });
-
-    // auto itc = thrust::copy_if(
-    //     policy, column_indices.begin(), column_indices.end(),
-    //     column_indices.begin(),
-    //     [] __device__(const vertex_t& x) -> bool { return x != -1; });
-
-
-    // cudaDeviceSynchronize();
-
-    // printf("copy_if on column_indices done\n");
-
-    auto itVM = thrust::copy_if(policy, nz_vals_vm.begin(),
-                               nz_vals_vm.end(), nz_vals_vm.begin(),
-                               [] __device__(const weight_t& nz) -> bool {
-                                 return nz != weight_t(0);
-                               });
-
-    // auto itv = thrust::copy_if(policy, nonzero_values.begin(),
-    //                            nonzero_values.end(), nonzero_values.begin(),
-    //                            [] __device__(const weight_t& nz) -> bool {
+    //     auto num_nzs = thrust::count_if(policy, 
+    //       nz_vals.begin() + iter_offset[chunk_iter] + chunk_iter_id * chunk_size, 
+    //       nz_vals.begin() + iter_offset[chunk_iter] + (chunk_iter_id + 1) * chunk_size,
+    //       [] __device__(const weight_t& nz) -> bool {
     //                              return nz != weight_t(0);
-    //                            }); 
+    //                            });
 
-    // cudaDeviceSynchronize();
+    //     thrust::copy_n(nz_vals.begin() + iter_offset[chunk_iter] + chunk_iter_id * chunk_size, 
+    //       num_nzs, nz_vals_h.begin() + row_off_h[j + 1]);
 
-    // printf("copy_if on nz_vals_vm done\n");    
+    //     thrust::copy_n(col_ind.begin() + iter_offset[chunk_iter] + chunk_iter_id * chunk_size, 
+    //       num_nzs, col_ind_h.begin() + row_off_h[j + 1]);
 
-    // printf("AFTER vm result vector C:\n");
-    // for (auto it: nz_vals_vm) 
-    //   std::cout << it << '\n';
+    //     // auto num_nzs = thrust::count_if(policy, 
+    //     //   nz_vals.begin() + chunk_iter * initial_size + chunk_iter_id * chunk_size, 
+    //     //   nz_vals.begin() + chunk_iter * initial_size + (chunk_iter_id + 1) * chunk_size,
+    //     //   [] __device__(const weight_t& nz) -> bool {
+    //     //                          return nz != weight_t(0);
+    //     //                        });
 
-    auto nz_nnz = thrust::distance(nz_vals_vm.begin(), itVM);
-    // auto nz_nnz = thrust::distance(nonzero_values.begin(), itv);
+    //     // thrust::copy_n(nz_vals.begin() + chunk_iter * initial_size + chunk_iter_id * chunk_size, 
+    //     //   num_nzs, nz_vals_h.begin() + row_off_h[j + 1]);
 
-    // for (int i = 0; i < nz_nnz; i++) {
-    //   assert(nz_vals_vm[i] == nonzero_values[i]);
+    //     // thrust::copy_n(col_ind.begin() + chunk_iter * initial_size + chunk_iter_id * chunk_size, 
+    //     //   num_nzs, col_ind_h.begin() + row_off_h[j + 1]);
+
+    //     row_off_h[j + 1] = row_off_h[j + 1] + num_nzs;
+    //     // offset += size_per_chunk[chunk_iter];
+    //   }
     // }
 
-    // int display_num = min(20, (int) nz_nnz);
+    // cudaEventRecord(end_dyn_spgemm_copy);
 
-    for (int i = 0; i < 20; i++)
-      fill_memory[i] = 1;
+    // cudaEventSynchronize(end_dyn_spgemm_copy);
 
-    // printf("nz_vals_vm[:%d] = ", display_num);
-    // for (int i = 0; i < display_num; i++)
-    //   std::cout << nz_vals_vm[i] << ' ';
-    // printf("\n");
+    // float elapsedTime_copy = 0;
+    // cudaEventElapsedTime(&elapsedTime_copy, start_dyn_spgemm_copy, end_dyn_spgemm_copy);
 
-    // printf("nonzero_values[:%d] = ", display_num);
-    // for (int i = 0; i < display_num; i++)
-    //   std::cout << nonzero_values[i] << ' ';
-    // printf("\n");
+    // std::cout << "dynamic spgemm copy: " << elapsedTime_copy << '\n';    
+    // std::cout << "dynamic spgemm end-to-end time: " << elapsedTime_copy + elapsedTime << '\n';
 
-    // auto idx_nnz = thrust::distance(column_indices.begin(), itc);
-    // auto nz_nnz = thrust::distance(nonzero_values.begin(), itv);
+    std::cout << "size of nz_vals vector: " << nz_vals.size() << '\n';
+    std::cout << "estimated nzs: " << estimated_nzs << '\n';
 
-    // std::cout << "idx_nnz ? nz_nnz : " << idx_nnz << " ? " << nz_nnz
-    //           << std::endl;
+    // std::cout << "nz_nnz: " << nz_nnz << '\n';
+    // std::cout << "row_off_h[A.get_number_of_vertices()]: " 
+    //     << row_off_h[A.get_number_of_vertices()] << '\n';
+
+    // for (int i = 0; i < nz_nnz; i++) {
+    //   assert(nz_vals_vm[i] == nz_vals_h[i]);
+    //   assert(column_indices_vm[i] == col_ind_h[i]);
+    // }
+
+    // for (int i = 0; i < A.get_number_of_vertices() + 1; i++) {
+    //   assert(row_offsets_vm[i] == row_off_h[i]);
+    // }
 
     /// Step X. Make sure C is set.
     C.number_of_rows = A.get_number_of_vertices();

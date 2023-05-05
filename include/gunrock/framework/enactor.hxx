@@ -12,6 +12,8 @@
 
 #include <gunrock/cuda/cuda.hxx>
 
+#include <gunrock/util/cpu_performance_metrics.hxx>
+
 #include <gunrock/framework/frontier/frontier.hxx>
 #include <gunrock/framework/problem.hxx>
 
@@ -32,7 +34,7 @@ struct enactor_properties_t {
    * Resizes the frontier by this factor * the size required.
    * @code frontier.resize(frontier_sizing_factor * new_size);
    */
-  float frontier_sizing_factor{1.5f};
+  float frontier_sizing_factor{1.75f};
 
   /*!
    * Number of frontier buffers to manage.
@@ -186,6 +188,7 @@ struct enactor_t {
 
       for (auto& buffer : frontiers) {
         buffer.set_resizing_factor(properties.frontier_sizing_factor);
+        initial_size = 0.001*initial_size;
         buffer.reserve((std::size_t)(initial_size));
       }
     }
@@ -244,10 +247,14 @@ struct enactor_t {
     prepare_frontier(get_input_frontier(), *context);
     auto timer = single_context->timer();
     timer.begin();
+    // util::perf_cpu_t perf_cpu;
+    // perf_cpu.start();
     while (!is_converged(*context)) {
       loop(*context);
       ++iteration;
     }
+    // perf_cpu.stop();
+    // printf("%lld misses\n", perf_cpu.count);
     finalize(*context);
     return timer.end();
   }

@@ -169,8 +169,19 @@ void execute(graph_t& G,
 
     /// @todo Resize the output (inactive) buffer to the new size.
     /// Can be hidden within the frontier struct.
-    if (output.get_capacity() < size_of_output)
+    if (output.get_capacity() < size_of_output){
+      // printf("Before:: capacity : %lu size of op: %lu\n", output.get_capacity(), size_of_output);
       output.reserve(size_of_output);
+      size_t free_byte ;
+      size_t total_byte ;
+      cudaMemGetInfo( &free_byte, &total_byte );
+      double free_db = (double)free_byte ;
+      double total_db = (double)total_byte ;
+      double used_db = total_db - free_db ;
+      printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n"
+          ,used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+      printf("After:: capacity : %lu\n", output.get_capacity());
+    }
     output.set_number_of_elements(size_of_output);
   }
 
@@ -187,7 +198,7 @@ void execute(graph_t& G,
 
   launch_box.calculate_grid_dimensions_strided(num_elements);
   auto kernel = block_mapped_kernel<  // kernel
-      launch_box.block_dimensions.x,  // threas per block
+      launch_box.block_dimensions.x,  // threads per block
       1,                              // items per thread
       input_type, output_type,        // i/o parameters
       graph_t,                        // graph type

@@ -137,6 +137,7 @@ class multi_context_t {
   thrust::host_vector<standard_context_t*> contexts;
   thrust::host_vector<gcuda::device_id_t> devices;
   static constexpr std::size_t MAX_NUMBER_OF_GPUS = 1024;
+  cudaStream_t stream_c;
 
   // Multiple devices.
   multi_context_t(thrust::host_vector<gcuda::device_id_t> _devices)
@@ -151,6 +152,7 @@ class multi_context_t {
   multi_context_t(thrust::host_vector<gcuda::device_id_t> _devices,
                   cudaStream_t _stream)
       : devices(_devices) {
+    stream_c = _stream;
     for (auto& device : devices) {
       standard_context_t* device_context =
           new standard_context_t(_stream, device);
@@ -169,6 +171,7 @@ class multi_context_t {
   // Single device with a user-provided stream
   multi_context_t(gcuda::device_id_t _device, cudaStream_t _stream)
       : devices(1, _device) {
+    stream_c = _stream;
     for (auto& device : devices) {
       standard_context_t* device_context =
           new standard_context_t(_stream, device);
@@ -181,6 +184,16 @@ class multi_context_t {
     auto contexts_ptr = contexts.data();
     return contexts_ptr[device];
   }
+
+  cudaError_t get_stream_status() { return cudaStreamQuery(stream_c); }
+
+  unsigned long long get_stream_id() { 
+    unsigned long long streamId;
+    cudaStreamGetId(stream_c, &streamId);
+    return streamId;
+  }
+
+  void synchronize_stream() { cudaStreamSynchronize(stream_c); }
 
   auto size() { return contexts.size(); }
 

@@ -62,6 +62,24 @@ void test_bfs(int num_arguments, char** argument_array) {
   thrust::device_vector<int> edges_visited(1);
   int search_depth = 0;
 
+  unsigned long fill_memory_val = 1000000000;
+  size_t free_byte ;
+  size_t total_byte ;
+  cudaMemGetInfo( &free_byte, &total_byte );
+  double free_db = (double)free_byte ;
+  double total_db = (double)total_byte ;
+  double used_db = total_db - free_db ;
+  printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n"
+          ,used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+  
+  thrust::device_vector<vertex_t> fill_memory(2.5*fill_memory_val);
+  cudaMemGetInfo( &free_byte, &total_byte );
+  free_db = (double)free_byte ;
+  total_db = (double)total_byte ;
+  used_db = total_db - free_db ;
+  printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n"
+          ,used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+
   // Parse sources
   std::vector<int> source_vect;
   gunrock::io::cli::parse_source_string(params.source_string, &source_vect,
@@ -127,6 +145,8 @@ void test_bfs(int num_arguments, char** argument_array) {
       edges_visited_vect.push_back(h_edges_visited[0]);
       search_depth_vect.push_back(search_depth);
     }
+
+    fill_memory[0] = 1;
 
     // For BFS - the number of nodes visited is just 2 * edges_visited
     std::transform(edges_visited_vect.begin(), edges_visited_vect.end(),

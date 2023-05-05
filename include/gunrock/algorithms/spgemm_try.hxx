@@ -192,8 +192,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       //initial_size = 524288*5;
       size_t size_per_thread = initial_size / A.get_number_of_vertices();
 
-      thrust::device_vector<weight_t, thrust::virtual_allocator<weight_t>> nz_vals;
-      // thrust::device_vector<weight_t> nz_vals;
+      // thrust::device_vector<weight_t, thrust::virtual_allocator<weight_t>> nz_vals;
+      thrust::device_vector<weight_t> nz_vals;
       nz_vals.resize(initial_size, weight_t(0));
       volatile weight_t* nz_vals_ptr = nz_vals.data().get();
 

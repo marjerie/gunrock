@@ -57,6 +57,53 @@ void test_sssp(int num_arguments, char** argument_array) {
   thrust::device_vector<int> vertices_visited(1);
   int search_depth = 0;
 
+  size_t free_byte;
+  size_t total_byte;
+  cudaMemGetInfo(&free_byte, &total_byte);
+  double free_db = (double) free_byte;
+  double total_db = (double) total_byte;
+  double used_db = total_db - free_db ;
+  printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n",
+      used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+
+  std::size_t initial_size = (G.get_number_of_edges() > G.get_number_of_vertices())
+              ? G.get_number_of_edges()
+              : G.get_number_of_vertices();
+
+  size_t b_to_fill = free_db - initial_size * sizeof(int) * 1.45;
+  size_t num_of_elements_to_fill = b_to_fill / sizeof(int);
+  std::cout << "num_of_elements_to_fill: " << num_of_elements_to_fill << std::endl;
+  thrust::device_vector<int> fill_memory(num_of_elements_to_fill, 0);
+
+  cudaMemGetInfo(&free_byte, &total_byte);
+  free_db = (double) free_byte;
+  total_db = (double) total_byte;
+  used_db = total_db - free_db ;
+  printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n",
+      used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+
+  // Fill memory
+
+  // unsigned long fill_memory_val = 1000000000;
+
+  // size_t free_byte ;
+  // size_t total_byte ;
+  // cudaMemGetInfo( &free_byte, &total_byte );
+  // double free_db = (double)free_byte ;
+  // double total_db = (double)total_byte ;
+  // double used_db = total_db - free_db ;
+  // printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n"
+  //     ,used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+
+  // thrust::device_vector<vertex_t> fill_memory(5*fill_memory_val);
+
+  // cudaMemGetInfo( &free_byte, &total_byte );
+  // free_db = (double)free_byte ;
+  // total_db = (double)total_byte ;
+  // used_db = total_db - free_db ;
+  // printf("GPU memory usage: used = %f, free = %f MB, total = %f MB\n"
+  //     ,used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
+
   // Parse sources
   std::vector<int> source_vect;
   gunrock::io::cli::parse_source_string(params.source_string, &source_vect,
@@ -86,6 +133,10 @@ void test_sssp(int num_arguments, char** argument_array) {
         predecessors.data().get(), edges_visited.data().get(),
         vertices_visited.data().get(), &search_depth));
   }
+
+  // Use memory allocated to fill
+  for (int i = fill_memory.size()-20; i < fill_memory.size(); i++)
+    fill_memory[i] = 1;
 
   print::head(distances, 40, "GPU distances");
   std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]

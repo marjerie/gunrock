@@ -11,6 +11,7 @@ struct parameters_t {
   std::string json_file = "";
   std::string tag_string = "";
   int num_runs = 1;
+  float resizing_factor = 1.0f;
   cxxopts::Options options;
   bool collect_metrics = false;
   bool validate = false;
@@ -45,14 +46,18 @@ struct parameters_t {
                             "comma-separated string of ints",
                             cxxopts::value<std::string>())  // source
           ("n,num_runs", "Number of runs (ignored if multiple sources passed)",
-           cxxopts::value<int>());  // runs
+           cxxopts::value<int>()) 
+           ("r,resizing_factor", "Resizing factor for frontier",
+                            cxxopts::value<float>());  // runs
       if (algorithm == "Breadth First Search" ||
           algorithm == "Single Source Shortest Path") {
         options.add_options()("validate", "CPU validation");  // validate
       }
     } else {
       options.add_options()("n,num_runs", "Number of runs",
-                            cxxopts::value<int>());  // runs
+                            cxxopts::value<int>()) 
+                            ("r,resizing_factor", "Resizing factor for frontier",
+                            cxxopts::value<float>());  // runs
     }
 
     // Parse command line arguments
@@ -88,6 +93,10 @@ struct parameters_t {
       num_runs = result["num_runs"].as<int>();
     }
 
+    if (result.count("resizing_factor") == 1) {
+      resizing_factor = result["resizing_factor"].as<float>();
+    }
+
     if (result.count("tag") == 1) {
       tag_string = result["tag"].as<std::string>();
     }
@@ -112,12 +121,18 @@ void parse_source_string(std::string source_str,
                          int n_runs) {
   if (source_str == "") {
     // Generate random starting source
-    std::random_device seed;
-    std::mt19937 engine(seed());
+    // std::random_device seed;
+    // std::mt19937 engine(seed());
+    // for (int i = 0; i < n_runs; i++) {
+    //   std::uniform_int_distribution<int> dist(0, n_vertices - 1);
+    //   source_vect->push_back(dist(engine));
+    // }
+
     for (int i = 0; i < n_runs; i++) {
-      std::uniform_int_distribution<int> dist(0, n_vertices - 1);
-      source_vect->push_back(dist(engine));
+      // std::uniform_int_distribution<int> dist(0, n_vertices - 1);
+      source_vect->push_back(0);
     }
+
   } else {
     std::stringstream ss(source_str);
     while (ss.good()) {
