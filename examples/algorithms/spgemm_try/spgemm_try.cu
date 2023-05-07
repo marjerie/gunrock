@@ -104,7 +104,8 @@ void test_spmv(int num_arguments, char** argument_array) {
       used_db/1024.0/1024.0, free_db/1024.0/1024.0, total_db/1024.0/1024.0);
 
   cudaStream_t streamk;
-  cudaStreamCreate(&streamk);
+  // cudaStreamCreate(&streamk);
+  cudaStreamCreateWithFlags(&streamk, cudaStreamNonBlocking);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     // Handle the error.

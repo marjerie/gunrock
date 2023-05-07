@@ -95,6 +95,82 @@ execute(graph_t& G, func_t op, gcuda::multi_context_t& context) {
   }
 }
 
+template <parallel_for_each_t type, typename func_t, typename graph_t>
+std::enable_if_t<type != parallel_for_each_t::element>
+execute(graph_t& G, func_t op, gcuda::multi_context_t& context, size_t size) {
+  static_assert((type == parallel_for_each_t::weight) ||
+                (type == parallel_for_each_t::edge) ||
+                (type == parallel_for_each_t::vertex));
+  using index_t = std::conditional_t<type == parallel_for_each_t::vertex,
+                                     typename graph_t::vertex_type,
+                                     typename graph_t::edge_type>;
+  auto single_context = context.get_context(0);
+  // std::size_t size = (type == parallel_for_each_t::vertex)
+  //                        ? G.get_number_of_vertices()
+  //                        : G.get_number_of_edges();
+
+  /// Note: For certain host platform/dialect, an extended lambda cannot be
+  /// defined inside the 'if' or 'else' block of a constexpr if statement.
+  switch (type) {
+    case parallel_for_each_t::weight:
+      thrust::for_each(
+          single_context->execution_policy(),
+          thrust::make_counting_iterator<index_t>(0),     // Begin: 0
+          thrust::make_counting_iterator<index_t>(size),  // End: # of V/E
+          [=] __device__(index_t const& x) {
+            op(G.get_edge_weight(x));
+          }  // Unary Operator
+      );
+      break;
+    default:
+      thrust::for_each(
+          single_context->execution_policy(),
+          thrust::make_counting_iterator<index_t>(0),     // Begin: 0
+          thrust::make_counting_iterator<index_t>(size),  // End: # of V/E
+          [=] __device__(index_t const& x) { op(x); }     // Unary Operator
+      );
+      break;
+  }
+}
+
+template <parallel_for_each_t type, typename func_t, typename graph_t>
+std::enable_if_t<type != parallel_for_each_t::element>
+execute(graph_t& G, func_t op, gcuda::multi_context_t& context, size_t size, int iter) {
+  static_assert((type == parallel_for_each_t::weight) ||
+                (type == parallel_for_each_t::edge) ||
+                (type == parallel_for_each_t::vertex));
+  using index_t = std::conditional_t<type == parallel_for_each_t::vertex,
+                                     typename graph_t::vertex_type,
+                                     typename graph_t::edge_type>;
+  auto single_context = context.get_context(0);
+  // std::size_t size = (type == parallel_for_each_t::vertex)
+  //                        ? G.get_number_of_vertices()
+  //                        : G.get_number_of_edges();
+
+  /// Note: For certain host platform/dialect, an extended lambda cannot be
+  /// defined inside the 'if' or 'else' block of a constexpr if statement.
+  switch (type) {
+    case parallel_for_each_t::weight:
+      thrust::for_each(
+          single_context->execution_policy(),
+          thrust::make_counting_iterator<index_t>(0),     // Begin: 0
+          thrust::make_counting_iterator<index_t>(size),  // End: # of V/E
+          [=] __device__(index_t const& x) {
+            op(G.get_edge_weight(x), iter, size);
+          }  // Unary Operator
+      );
+      break;
+    default:
+      thrust::for_each(
+          single_context->execution_policy(),
+          thrust::make_counting_iterator<index_t>(0),     // Begin: 0
+          thrust::make_counting_iterator<index_t>(size),  // End: # of V/E
+          [=] __device__(index_t const& x) { op(x, iter, size); }     // Unary Operator
+      );
+      break;
+  }
+}
+
 }  // namespace parallel_for
 }  // namespace operators
 }  // namespace gunrock

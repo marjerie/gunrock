@@ -188,16 +188,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
       edge_t* row_offsets_vm_ptr = row_offsets_vm.data().get();
 
-      size_t initial_size = 5242880;
-      //initial_size = 524288*5;
-      size_t size_per_thread = initial_size / A.get_number_of_vertices();
+      // volatile weight_t* nz_vals_ptr = nz_vals.data().get();
 
-      // thrust::device_vector<weight_t, thrust::virtual_allocator<weight_t>> nz_vals;
-      thrust::device_vector<weight_t> nz_vals;
-      nz_vals.resize(initial_size, weight_t(0));
-      volatile weight_t* nz_vals_ptr = nz_vals.data().get();
-
-      std::cout << "nz_vals.data().get()" << nz_vals.data().get() << '\n';
+      // std::cout << "nz_vals.data().get()" << nz_vals.data().get() << '\n';
 
       // thrust::device_vector<int> num_of_extra_chunks(1, 0);
       // int* num_of_extra_chunks_ptr = num_of_extra_chunks.data().get();
@@ -315,8 +308,22 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     // volatile size_t* cpu_new_size, *new_size;
     volatile int* cpu_extra_chunk_size, *extra_chunk_size, *h_data, *real_chunk_size, *h_real;
+    volatile int* cpu_done_row_count, *done_row_count, *h_done;
+    volatile uint64_t* cpu_addr, *addr, *h_addr;
     volatile bool* vector_ready, *h_ready, *cpu_vector_ready;
     int actual_extra_chunk_size = 0;
+
+    size_t initial_size = 524288;
+    size_t min_size_per_thread = 8;
+    // size_t size_per_thread = initial_size / A.get_number_of_vertices();
+    size_t size_per_thread;
+    int num = 1;
+    size_per_thread = initial_size * num / A.get_number_of_vertices();
+    while (size_per_thread <= min_size_per_thread) {
+      num++;
+      size_per_thread = initial_size * num / A.get_number_of_vertices();
+    }
+    initial_size = initial_size * num;
 
     cudaSetDeviceFlags(cudaDeviceMapHost);
     cudaError_t err = cudaGetLastError();
@@ -327,6 +334,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     cudaHostAlloc((void **)&h_data, sizeof(int), cudaHostAllocMapped);
     cudaHostAlloc((void **)&h_ready, sizeof(bool), cudaHostAllocMapped);
     cudaHostAlloc((void **)&h_real, sizeof(int), cudaHostAllocMapped);
+    cudaHostAlloc((void **)&h_done, sizeof(int), cudaHostAllocMapped);
+    cudaHostAlloc((void **)&h_addr, sizeof(uint64_t), cudaHostAllocMapped);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
       // Handle the error.
@@ -335,6 +344,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     cudaHostGetDevicePointer((int **)&extra_chunk_size, (int *)h_data, 0);
     cudaHostGetDevicePointer((bool **)&vector_ready, (bool *)h_ready, 0);
     cudaHostGetDevicePointer((int **)&real_chunk_size, (int *)h_real, 0);
+    cudaHostGetDevicePointer((int **)&done_row_count, (int *)h_done, 0);
+    cudaHostGetDevicePointer((uint64_t **)&addr, (uint64_t *)h_addr, 0);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
       // Handle the error.
@@ -344,14 +355,35 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     *extra_chunk_size = 0;
     *vector_ready = true;
     *real_chunk_size = 0;
+    *done_row_count = 0;
 
     // gets new size from kernel
     int *atomic_extra_chunk_size;
     cudaMalloc((int **)&atomic_extra_chunk_size, sizeof(int));
     cudaMemset((void *)atomic_extra_chunk_size, 0x0, sizeof(int));
 
-    auto dynamic_spgemm = [=] __host__ __device__(vertex_t const& row) -> bool {
+    int *next_iter_count;
+    cudaMalloc((int **)&next_iter_count, sizeof(int));
+    cudaMemset((void *)next_iter_count, 0x0, sizeof(int));
+
+    thrust::device_vector<int> active_row;
+    active_row.resize(A.get_number_of_vertices(), 1);
+    int* active_row_ptr = active_row.data().get();
+
+    size_t min_num_of_threads_per_kernel = 225000;
+    size_t remaining_threads = A.get_number_of_vertices();
+
+    // volatile uint64_t* d_addr;
+    // cudaMalloc((uint64_t **)&d_addr, sizeof(uint64_t));
+
+    int* iter;
+    cudaMalloc((int **)&iter, sizeof(int));
+
+    auto dynamic_spgemm = [=] __host__ __device__(vertex_t const& id, int iter, size_t size) -> bool {
       // Get the number of nonzeros in row of sparse-matrix A.
+      vertex_t row = (iter) * min_num_of_threads_per_kernel + id;
+      if (row >= A.get_number_of_vertices()) printf("%d %d\n", iter, id);
+      // assert(row < A.get_number_of_vertices());
       auto a_offset = A.get_starting_edge(row);
       auto a_nnz = A.get_number_of_neighbors(row);
       auto c_offset = row * size_per_thread;
@@ -366,8 +398,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         auto b_nnz = B.get_number_of_neighbors(b_col);
         auto b_nz_idx = b_offset;
         auto a_nz_idx = a_offset;
+        weight_t c_nz = 0;
+        // volatile weight_t* nz_vals_ptr = (weight_t *) *d_addr;
 
-        //if (row == 0) printf("for loop: %d %d\n", num_of_extra_chunks, *extra_chunk_size);
+      //  if(num_of_extra_chunks >=1) printf(" loop: %d %d\n", num_of_extra_chunks, *extra_chunk_size);
 
         // For the row in A, multiple with corresponding element in B.
         while ((a_nz_idx < (a_offset + a_nnz)) && (b_nz_idx < (b_offset + b_nnz))) {
@@ -379,33 +413,31 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
               auto a_nz = A.get_edge_weight(a_nz_idx);
               auto b_nz = B.get_edge_weight(b_nz_idx);
 
-              // if (n == size_per_thread/4) {
-              //   if (*real_chunk_size <= num_of_extra_chunks) {
-              //     // printf("stuck here... ");
-              //     int old = math::atomic::cas((int*) atomic_extra_chunk_size, num_of_extra_chunks, 
-              //         num_of_extra_chunks + 1);
-              //     *extra_chunk_size = *atomic_extra_chunk_size;
-              //     //while (*real_chunk_size <= num_of_extra_chunks);
-              //   }
-              // }
+              //if(num_of_extra_chunks >=1) printf("n: %d %d\n", n, size_per_thread);
 
               if (n >= size_per_thread) {
+                // math::atomic::add((int*) next_iter_count, 1);
                 n = 0;
+                // while ((*next_iter_count + *done_row_count) < size) {
+                //   printf("%lu %lu\n", (*next_iter_count + *done_row_count), size);
+                // }
                 if (*real_chunk_size <= num_of_extra_chunks) {
                   // printf("stuck here... ");
+                  //if (num_of_extra_chunks ==  1) printf("huh..\n");
                   int old = math::atomic::cas((int*) atomic_extra_chunk_size, num_of_extra_chunks, 
                       num_of_extra_chunks + 1);
                   *extra_chunk_size = *atomic_extra_chunk_size;
-                  while (*real_chunk_size <= num_of_extra_chunks);
+                  while (*real_chunk_size <= num_of_extra_chunks) {
+                    // printf("here %d %d\n",*real_chunk_size, num_of_extra_chunks );
+                  }
+                  // nz_vals_ptr = (weight_t *) *d_addr;
                 }
-              
                 while (*real_chunk_size <= num_of_extra_chunks);
                 num_of_extra_chunks++;
               }
 
               // Calculate  C's nonzero index.
-              std::size_t c_nz_idx = c_offset + initial_size * num_of_extra_chunks + n;
-              //assert(c_nz_idx < estimated_nzs);
+              // std::size_t c_nz_idx = c_offset + initial_size * num_of_extra_chunks + n;
 
               // Assign column index.
               // thread::store(&column_indices_vm_ptr[c_nz_idx], n);
@@ -413,9 +445,15 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
               // Accumulate the nonzero value.
               // assert(*real_chunk_size >= num_of_extra_chunks);
-              if (*real_chunk_size < num_of_extra_chunks) printf("%d %d\n", *real_chunk_size, num_of_extra_chunks);
-              assert(c_nz_idx < (initial_size * (num_of_extra_chunks + 1)));
+              // while (!(*vector_ready));
+              // nz_vals_ptr = (weight_t *) *d_addr;
+              // if (*real_chunk_size < num_of_extra_chunks) printf("%d %d\n", *real_chunk_size, num_of_extra_chunks);
+              // assert(c_nz_idx < (initial_size * (num_of_extra_chunks + 1)));
+              // while (!(*vector_ready));
+              // nz_vals_ptr = (weight_t *) *d_addr;
               // nz_vals_ptr[c_nz_idx] += a_nz * b_nz;
+              // ((weight_t *)(*addr))[c_nz_idx] += a_nz * b_nz;
+              c_nz += a_nz * b_nz;
 
               a_nz_idx++;
               b_nz_idx++;
@@ -427,71 +465,93 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
         // a non zero element was stored in C, so we increment n
         if (increment) {
+          std::size_t c_nz_idx = c_offset + initial_size * num_of_extra_chunks + n;
+          while(!(*vector_ready));
+          // math::atomic::add((int*)(*addr) + c_nz_idx, (int) c_nz);
+          ((weight_t *)(*addr))[c_nz_idx] = c_nz;
           n++;
           increment = false;
         }
       }
+      // printf("yay done with kernel!\n");
+      math::atomic::add((int*) done_row_count, 1);
+      active_row_ptr[row] = 0;
       return false;
     };
 
-    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
-        A, dynamic_spgemm, context);
+    thrust::device_vector<weight_t, thrust::virtual_allocator<weight_t>> nz_vals;
+    // thrust::device_vector<weight_t> nz_vals;
+    nz_vals.resize(initial_size, weight_t(0));
 
-    // unsigned long long streamId;
-    // cudaStreamGetId(context.get_stream(), &streamId);
-    // cudaError_t err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "Error: " << cudaGetErrorString(err) << std::endl;
-    // }
+    // uint64_t addr = (uint64_t) nz_vals.data().get();
+    // cudaMemcpy((void*)d_addr, &addr, sizeof(uint64_t), cudaMemcpyHostToDevice);
+    *addr = (uint64_t) nz_vals.data().get();
+    int h_iter = 0;
 
-    // std::cout << "cudaStreamQuery: " << cudaStreamQuery(context.get_stream()) << '\n';
-    // std::cout << "cudaStream: " << streamId << '\n';
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "Error: " << cudaGetErrorString(err) << std::endl;
-    // }
+    cudaDeviceSynchronize();
+
+    do {
+      size_t threads_per_kernel = min(min_num_of_threads_per_kernel, remaining_threads);
+      // cudaMemcpy((void *)iter, &h_iter, sizeof(int), cudaMemcpyHostToDevice);
+      operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
+          A, dynamic_spgemm, context, threads_per_kernel, h_iter);
+      remaining_threads -= threads_per_kernel;
+      h_iter++;
+    } while (remaining_threads > 0);
 
     std::cout << "cudaStreamQuery: " << context.get_stream_status() << '\n';
     std::cout << "cudaStream: " << context.get_stream_id() << '\n';
     
-    // if (cudaStreamQuery(context.get_stream()) == cudaSuccess) printf("uhhh....\n");
-    // err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //   // Handle the error.
-    //   std::cout << "Error: " << cudaGetErrorString(err) << std::endl;
-    // }
+    // if (context.get_stream_status() == cudaSuccess) printf("uhhh....\n");
 
-    if (context.get_stream_status() == cudaSuccess) printf("uhhh....\n");
+    thrust::device_vector<int>::iterator iter_thrust;
 
     // while (cudaStreamQuery(context.get_stream()) != cudaSuccess) {
-    while (context.get_stream_status() == cudaSuccess) {
-      //printf("yay here... ");
+    // while (context.get_stream_status() == cudaSuccess) {
+      do {
       // cpu_extra_chunk_size = extra_chunk_size;
       int chunk_size = *extra_chunk_size;
       cpu_vector_ready = vector_ready;
+      cpu_done_row_count = done_row_count;
+      cpu_addr = addr;
       // if (*cpu_extra_chunk_size > actual_extra_chunk_size) {
       if (chunk_size > actual_extra_chunk_size) {
+        std::cout << "--------------------------------------------------------\n";
         // printf("yay here... %d\n", *cpu_extra_chunk_size);
+        *h_ready = false;
         printf("yay here... %d\n", chunk_size);
-        *cpu_vector_ready = false;
+        // *cpu_vector_ready = false;
         // nz_vals.resize((*(cpu_extra_chunk_size) + 1) * initial_size);
         nz_vals.resize((chunk_size + 1) * initial_size);
         std::cout << "done resizing!\n";
         // actual_extra_chunk_size = *cpu_extra_chunk_size;
-        nz_vals_ptr = nz_vals.data().get();
+
+        // addr = (uint64_t) nz_vals.data().get();
+        // cudaMemcpy((void *)d_addr, &addr, sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+        *cpu_addr = (uint64_t) nz_vals.data().get();
         actual_extra_chunk_size = chunk_size;
         *real_chunk_size = actual_extra_chunk_size;
-        *cpu_vector_ready = true;
+        *h_ready = true;
+        // *cpu_vector_ready = true;
+        std::cout << "size_per_thread: " << size_per_thread << '\n';
         std::cout << "actual_extra_chunk_size: " << actual_extra_chunk_size << '\n';
-        std::cout << "nz_vals_ptr: " << nz_vals_ptr << '\n';
+        std::cout << "size of nz_vals: " << nz_vals.size() << '\n';
         std::cout << "nz_vals.data().get()" << nz_vals.data().get() << '\n';
-        //nz_vals_ptr = nz_vals.data().get();
+        std::cout << "--------------------------------------------------------\n";
       }
-    }
+    } while(*cpu_done_row_count < A.get_number_of_vertices());
 
     std::cout << "after.. cudaStreamQuery: " << context.get_stream_status() << '\n';
+
+      iter_thrust = thrust::find(policy, active_row.begin(), active_row.end(), 1);
+      if (iter_thrust != active_row.end()) std::cout << "yikes...\n";
+      assert(iter_thrust == active_row.end());
+
+    // printf("nz_vals[:%d] = ", 40);
+    // for (int i = 0; i < 40; i++)
+    //   std::cout << nz_vals[i] << ' ';
+    // printf("\n");
 
     //context.synchronize_stream();  
 
@@ -505,6 +565,31 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // Handle the error.
       std::cout << "Error: " << cudaGetErrorString(err) << std::endl;
     }
+
+    // thrust::host_vector<weight_t> nz_vals_h(nz_vals.size(), 0);
+    // // thrust::host_vector<vertex_t> col_ind_h(col_ind.size(), -1);
+    // thrust::host_vector<edge_t> row_off_h(A.get_number_of_vertices() + 1, 0);
+
+    // for (size_t j = 0; j < A.get_number_of_vertices(); j++) {
+    //   int iters = actual_extra_chunk_size + 1;
+    //   row_off_h[j + 1] = row_off_h[j];
+    //   for (int chunk_iter = 0; chunk_iter < iters; chunk_iter++) {
+    //     int chunk_size = size_per_thread;
+
+    //     auto num_nzs = thrust::count_if(policy, 
+    //       nz_vals.begin() + chunk_iter * initial_size + j * chunk_size, 
+    //       nz_vals.begin() + chunk_iter * initial_size + (j + 1) * chunk_size,
+    //       [] __device__(const weight_t& nz) -> bool {
+    //                              return nz != weight_t(0);
+    //                            });
+
+    //     thrust::copy_n(nz_vals.begin() + chunk_iter * initial_size + j * chunk_size, 
+    //       num_nzs, nz_vals_h.begin() + row_off_h[j + 1]);
+
+    //     row_off_h[j + 1] = row_off_h[j + 1] + num_nzs;
+    //     // offset += size_per_chunk[chunk_iter];
+    //   }
+    // }
 
     // printf("---------------------------------------------------\n");
 
@@ -595,6 +680,11 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     //   std::cout << it << '\n';
 
     auto nz_nnz = thrust::distance(nz_vals_vm.begin(), itVM);
+
+    std::cout << "nz_nnz: " << nz_nnz << '\n';
+    // std::cout << "row_off_h[A.get_number_of_vertices()]: " 
+    //     << row_off_h[A.get_number_of_vertices()] << '\n';
+
     // auto nz_nnz = thrust::distance(nonzero_values.begin(), itv);
 
     // for (int i = 0; i < nz_nnz; i++) {
